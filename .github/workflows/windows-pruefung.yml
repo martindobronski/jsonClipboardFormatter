@@ -1,0 +1,522 @@
+# Laeuft start.bat auf echtem Windows aus.
+#
+# Die Testklasse StartSkriptTest startet bisher nur start.sh. start.bat war
+# ueberhaupt nie auf Windows gelaufen - geprueft wurde nur, dass die Datei
+# ASCII ist, CRLF hat und keine verbotenen Pipezeichen in for /f enthaelt. Das
+# ist eine statische Pruefung; sie sagt nichts darueber, ob cmd.exe das Skript
+# auch ausfuehrt. Dieser Workflow schliesst die Luecke.
+#
+# Ohne diesen Lauf fehlt fuer die Windows-Auslieferung die einfachste
+# Ueberpruefung, die es gibt.
+
+name: Windows-Pruefung
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "start.bat"
+      - "start.sh"
+      # Die Vorlage wird von der Testsuite gelesen (StartSkriptTest) und von
+      # start.bat zur Laufzeit ausgewertet. Ohne sie hier waere eine Aenderung
+      # an ihr unbemerzt durchgegangen.
+      - "start.conf.example"
+      - "pom.xml"
+      - ".gitattributes"
+      - ".gitignore"
+      - ".github/workflows/windows-pruefung.yml"
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # Der zweite Job beweist, was der erste nicht kann: dass die App auch dann
+  # startet, wenn es auf dem Rechner kein Java gibt. Er legt dafuer genau die
+  # Verzeichnisstruktur an, die das Release-ZIP hat - start.bat, jre/ und das
+  # fertige Jar, ohne pom.xml, ohne src/ und ohne Maven.
+  mitgelieferte-laufzeit:
+    name: Release-Aufbau ohne System-Java
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Java 25 bereitstellen
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Temurin-JRE nach jre/ entpacken
+        shell: pwsh
+        # Feste Version und feste Pruefsumme. "latest" waere bequemer, aber
+        # dann aendert sich die Lieferung ohne dass jemand es im Diff sieht -
+        # und ein fremder Download ohne Pruefsumme ist keine Lieferung, die man
+        # einem Endnutzer zumuten sollte. Stand: 25.0.4+101, die LTS-Linie.
+        env:
+          JRE_URL: "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.4.1%2B1/OpenJDK25U-jre_x64_windows_hotspot_25.0.4.1_1.zip"
+          JRE_SHA256: "4c95451cea98556def2c54f7782933f52a26d4a36bd85e1d59f0364464828b07"
+        run: |
+          $cache = Join-Path $env:RUNNER_TEMP "jre.zip"
+          Write-Host "Lade die Temurin-JRE"
+          Invoke-WebRequest -Uri $env:JRE_URL -OutFile $cache
+          $groesse = (Get-Item $cache).Length
+          Write-Host ("Download: {0:N1} MB" -f ($groesse / 1MB))
+
+          $ist = (Get-FileHash -Path $cache -Algorithm SHA256).Hash.ToLower()
+          if ($ist -ne $env:JRE_SHA256) {
+            throw "Pruefsumme weicht ab. erwartet $env:JRE_SHA256, bekommen $ist"
+          }
+          Write-Host "Pruefsumme stimmt."
+
+          $entpack = Join-Path $env:RUNNER_TEMP "jre-ausgepackt"
+          Expand-Archive -Path $cache -DestinationPath $entpack -Force
+          # Das ZIP enthaelt ein einzelnes Wurzelverzeichnis, das muss weg,
+          # damit danach jre/bin/java.exe liegt und nicht jre/jdk-25.../bin/...
+          $wurzel = Get-ChildItem $entpack -Directory | Select-Object -First 1
+          if (-not $wurzel) { throw "das Archiv enthaelt kein Wurzelverzeichnis" }
+          Move-Item $wurzel.FullName (Join-Path $env:GITHUB_WORKSPACE "jre")
+          Remove-Item $entpack -Recurse -Force
+          & ".\jre\bin\java.exe" -version
+
+      - name: Jar bauen
+        run: mvn -B -DskipTests package
+
+      - name: Release-Verzeichnis nachbauen
+        shell: pwsh
+        # Genau das, was spaeter im Release-ZIP liegt: kein pom.xml, kein src/,
+        # kein Maven. Wer das nicht nachstellt, prueft den Entwicklerstand und
+        # nicht das, was Nutzer bekommen.
+        run: |
+          $ziel = Join-Path $env:RUNNER_TEMP "release"
+          Remove-Item $ziel -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $ziel | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $ziel "target") | Out-Null
+
+          Copy-Item start.bat $ziel
+          Copy-Item start.conf.example $ziel
+          Copy-Item -Recurse jre $ziel
+          Copy-Item target\JsonClipboardFormatter-*.jar (Join-Path $ziel "target")
+          Copy-Item README.md $ziel
+
+          if (Test-Path (Join-Path $ziel "pom.xml")) { throw "pom.xml gehoert nicht ins ZIP" }
+          if (Test-Path (Join-Path $ziel "src")) { throw "src/ gehoert nicht ins ZIP" }
+          Write-Host "Aufgebaut: $ziel"
+          & (Join-Path $ziel "jre\bin\java.exe") -version
+
+      # Ab hier wird nichts mehr ueber GITHUB_ENV oder GITHUB_PATH
+      # umgestellt. Das hatte einen Versuch gekostet: setup-java schreibt
+      # seinen Toolpfad selbst in GITHUB_PATH, und zwei Eintraege fuer
+      # denselben Namen werden in einer Reihenfolge angewendet, die man nicht
+      # kontrolliert - der java-Eintrag blieb stehen. Ein Kindprozess erbt
+      # dagegen zuverlaessig die Umgebung des aufrufenden Prozesses, also wird
+      # sie hier direkt geaendert. Der Build ist dafuer vorher gelaufen.
+      - name: "-Pruefen ohne System-Java"
+        shell: pwsh
+        run: |
+          function BlendesSystemJava {
+            $neu = @()
+            foreach ($eintrag in ($env:PATH -split ';')) {
+              if ($eintrag -and $eintrag -notmatch '(?i)java|jdk|temurin|hostedtoolcache') {
+                $neu += $eintrag
+              }
+            }
+            $env:PATH = $neu -join ';'
+            $env:JAVA_HOME = ""
+            $env:MAVEN_HOME = ""
+            $env:JAVA_HOME_25_X64 = ""
+            $env:JSONFORMATTER_JAVA = ""
+          }
+          BlendesSystemJava
+
+          # Genau die vier Quellen, die start.bat kennt. Bewusst KEINE Suche
+          # nach java.exe auf der Platte: start.bat tastet die Platte nicht ab,
+          # ein Laufwerksdurchsuchen beweist also nichts und findet auf jedem
+          # Runner irgendetwas. massgeblich ist, was "where java" findet - das
+          # ist der Befehl, mit dem das Skript selbst sucht.
+          Write-Host "=== Quellen von start.bat ==="
+          Write-Host "JAVA_HOME        = '$env:JAVA_HOME'"
+          Write-Host "JSONFORMATTER_JAVA= '$env:JSONFORMATTER_JAVA'"
+          $where = cmd /c "where java 2>nul"
+          if ($where) { throw "where java findet noch etwas: $where" }
+          Write-Host "where java       findet nichts"
+          Write-Host "jre/             = $(if (Test-Path "$env:RUNNER_TEMP\release\jre\bin\java.exe") { 'vorhanden' } else { 'FEHLT' })"
+
+          $ziel = Join-Path $env:RUNNER_TEMP "release"
+          $ausgabe = cmd /c "cd /d `"$ziel`" && start.bat -Pruefen" 2>&1
+          $ausgabe | ForEach-Object { Write-Host $_ }
+          $text = ($ausgabe | Out-String)
+          if ($LASTEXITCODE -ne 0) { throw "start.bat -Pruefen endete mit $LASTEXITCODE" }
+          if (-not $text.Contains("(mitgeliefert)")) {
+            throw "start.bat hat die mitgelieferte Laufzeit nicht genommen"
+          }
+          if (-not $text.Contains("jre\bin\java.exe")) {
+            throw "die genutzte Laufzeit liegt nicht im jre-Ordner"
+          }
+          Write-Host "start.bat nutzt die mitgelieferte Laufzeit."
+
+      - name: die App startet ohne System-Java
+        shell: pwsh
+        run: |
+          $neu = @()
+          foreach ($eintrag in ($env:PATH -split ';')) {
+            if ($eintrag -and $eintrag -notmatch '(?i)java|jdk|temurin|hostedtoolcache') {
+              $neu += $eintrag
+            }
+          }
+          $env:PATH = $neu -join ';'
+          $env:JAVA_HOME = ""
+          $env:MAVEN_HOME = ""
+          $env:JAVA_HOME_25_X64 = ""
+          $env:JSONFORMATTER_JAVA = ""
+          if (cmd /c "where java 2>nul") { throw "es ist noch ein Java auffindbar" }
+
+          $ziel = Join-Path $env:RUNNER_TEMP "release"
+          $log = Join-Path $env:RUNNER_TEMP "release-start.log"
+          $prozess = Start-Process -FilePath "cmd.exe" `
+              -ArgumentList "/c", "cd /d `"$ziel`" && start.bat" `
+              -PassThru -NoNewWindow `
+              -RedirectStandardOutput $log `
+              -RedirectStandardError "$log.err"
+          Write-Host "cmd gestartet: $($prozess.Id)"
+
+          $jvm = $null
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 2
+            $jvm = Get-Process -Name java -ErrorAction SilentlyContinue
+            if ($jvm) { break }
+            if ($prozess.HasExited) {
+              Write-Host "start.bat endete vorzeitig mit $($prozess.ExitCode)"
+              break
+            }
+          }
+
+          if (-not $jvm) {
+            Write-Host "--- release-start.log ---"
+            if (Test-Path $log) { Get-Content $log }
+            Write-Host "--- release-start.log.err ---"
+            if (Test-Path "$log.err") { Get-Content "$log.err" }
+            throw "keine JVM gestartet - ohne System-Java laeuft die App nicht"
+          }
+
+          # Der Nachweis, dass es wirklich die mitgelieferte JVM ist: der
+          # Prozesspfad muss im jre-Ordner des Release-Verzeichnisses liegen.
+          # Scheitert der Start an einem System-Java, faellt es genau hier.
+          $pfade = $jvm | ForEach-Object { $_.Path }
+          $pfade | ForEach-Object { Write-Host "  JVM: $_" }
+          $fremd = $pfade | Where-Object { $_ -notlike "$ziel\jre\*" }
+          if ($fremd) { throw "die JVM kam nicht aus dem Release: $fremd" }
+          Write-Host "Beendet. Die App startet aus dem Release-Aufbau heraus ohne System-Java."
+
+          $jvm | Stop-Process -Force
+          if (-not $prozess.HasExited) { $prozess | Stop-Process -Force }
+
+          # pwsh gibt den Exit-Code des letzten nativen Aufrufs als eigenen
+          # weiter. Der letzte ist "where java" aus dem Kopf dieses Schrittes,
+          # und genau das soll ja scheitern - der Schritt waere sonst nach
+          # einem vollen Erfolg rot. Jeder echte Fehler wird weiter oben per
+          # throw abgefangen; bis hierher ist also alles in Ordnung.
+          exit 0
+
+  startbat:
+    name: start.bat auf windows-latest
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Java 25 bereitstellen
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Laufzeitlage des Runners festhalten
+        shell: pwsh
+        # Ohne jmods kann jlink kein Laufzeitbild bauen. Dieser Schritt sagt
+        # nach, was tatsaechlich da ist, statt es zu vermuten - der erste Lauf
+        # hat hier abgebrochen, weil Temurin 25 die jmods nicht mitbringt.
+        run: |
+          Write-Host "JAVA_HOME = $env:JAVA_HOME"
+          Write-Host "--- Inhalt von JAVA_HOME ---"
+          Get-ChildItem $env:JAVA_HOME -Force |
+            Select-Object -ExpandProperty Name | ForEach-Object { Write-Host "  $_" }
+
+          $jmods = Join-Path $env:JAVA_HOME "jmods"
+          if (Test-Path $jmods) {
+            $anzahl = (Get-ChildItem $jmods -Filter *.jmod).Count
+            Write-Host "jmods: $anzahl Dateien - jlink kann ein Bild bauen"
+          } else {
+            Write-Host "jmods: FEHLT - dieser JDK-Build traegt sie nicht"
+            Write-Host "--- Inhalt von lib ---"
+            Get-ChildItem (Join-Path $env:JAVA_HOME "lib") -Force |
+              Select-Object -ExpandProperty Name | ForEach-Object { Write-Host "  $_" }
+          }
+
+          Write-Host "--- weitere JDKs auf dem Runner ---"
+          foreach ($wurzel in @("C:\hostedtoolcache\windows", "C:\Program Files\Java")) {
+            if (Test-Path $wurzel) {
+              Get-ChildItem $wurzel -Directory -ErrorAction SilentlyContinue |
+                ForEach-Object { Write-Host "  $($_.FullName)" }
+            }
+          }
+
+          Write-Host "--- jlink vorhanden? ---"
+          $jlink = Get-Command jlink -ErrorAction SilentlyContinue
+          if ($jlink) {
+            Write-Host "  $($jlink.Source)"
+            jlink --version
+          } else {
+            Write-Host "  jlink fehlt im PATH"
+          }
+
+      - name: Kompletter Testlauf
+        shell: pwsh
+        # Verifiziert zugleich, dass die .gitattributes unter Windows greifen:
+        # startBat_windows_konventionen schlaegt fehl, falls die Datei ohne CR
+        # ausgecheckt wurde.
+        run: mvn -B clean verify
+
+      - name: start.bat -Pruefen ausfuehren
+        shell: pwsh
+        run: |
+          $ausgabe = cmd /c "start.bat -Pruefen" 2>&1
+          $ausgabe | ForEach-Object { Write-Host $_ }
+          if ($LASTEXITCODE -ne 0) {
+            throw "start.bat -Pruefen endete mit $LASTEXITCODE"
+          }
+          # Der Text wird zusammengehaengt geprueft. -notmatch auf ein Array
+          # liefert die nicht passenden Elemente zurueck - bei fuenf Zeilen
+          # gewinnt damit immer das Array der vier uebrigen, und der Schritt
+          # waere bei korrekter Ausgabe fehlgeschlagen.
+          $text = ($ausgabe | Out-String)
+          foreach ($pflicht in @("Java    :", "Konfig  :", "Maven   :", "Jar     :",
+                                  "Bauen   :", "Argumente:")) {
+            if (-not $text.Contains($pflicht)) {
+              throw "In der Ausgabe fehlt die Zeile: $pflicht"
+            }
+          }
+
+          # Die Zeile "Jar     :" nennt den Namen, den start.bat aus der pom.xml
+          # gelesen hat. Bisher wurde nur geprueft, dass die Zeile ueberhaupt
+          # dasteht - ein falscher Name faellt erst beim Start auf, als
+          # "unable to access jarfile". Genau da ist ein Fehler teuer, also
+          # wird der Name hier gegen die pom.xml gehalten. Der Ausdruck in
+          # start.bat greift auf dieselbe Gruppe zu (.Groups[1]); ein Versatz
+          # darin faellt hier auf.
+          $version = ([regex]::Match((Get-Content -Raw pom.xml), '<version>([^<]+)</version>')).Groups[1].Value
+          if (-not $version) { throw "die Version liess sich nicht aus der pom.xml" }
+          $erwartet = "JsonClipboardFormatter-$version.jar"
+          if (-not $text.Contains($erwartet)) {
+            throw "start.bat nennt nicht das Jar der pom.xml: erwartet $erwartet"
+          }
+          Write-Host "Jar-Name stimmt mit der pom.xml ueberein: $erwartet"
+          Write-Host "start.bat -Pruefen hat alle Zeilen geliefert."
+
+      - name: start.bat startet die App wirklich
+        shell: pwsh
+        # Der eigentliche Beweis. Ein Skript kann alle statischen Pruefungen
+        # bestehen und beim Start trotzdem abbrechen. Deshalb wird der Prozess
+        # gestartet und danach gefragt, ob eine JVM laeuft.
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP "start.log"
+          $prozess = Start-Process -FilePath "cmd.exe" `
+              -ArgumentList "/c", "start.bat" `
+              -PassThru -NoNewWindow `
+              -RedirectStandardOutput $log `
+              -RedirectStandardError "$log.err"
+          Write-Host "cmd gestartet: $($prozess.Id)"
+
+          $jvm = $null
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 2
+            $jvm = Get-Process -Name java -ErrorAction SilentlyContinue
+            if ($jvm) { break }
+            if ($prozess.HasExited) {
+              Write-Host "start.bat endete vorzeitig mit $($prozess.ExitCode)"
+              break
+            }
+          }
+
+          if (-not $jvm) {
+            Write-Host "--- start.log ---"
+            if (Test-Path $log) { Get-Content $log }
+            Write-Host "--- start.log.err ---"
+            if (Test-Path "$log.err") { Get-Content "$log.err" }
+            throw "keine JVM gestartet - die App laeuft nicht auf diesem Rechner"
+          }
+
+          Write-Host "JVM laeuft: PID $($jvm.Id -join ', ')"
+          $jvm | Select-Object Id, ProcessName | Format-Table | Out-Host
+
+          # Wieder beenden, der Runner soll nicht offen bleiben.
+          $jvm | Stop-Process -Force
+          if (-not $prozess.HasExited) { $prozess | Stop-Process -Force }
+          Write-Host "Beendet. start.bat startet die App auf Windows."
+
+      - name: start.local.conf wird gelesen
+        shell: pwsh
+        # Die StartSkriptTest koennen das nur fuer start.sh ausfuehren. Fuer
+        # start.bat braucht es diesen Schritt, sonst waere die Konfiguration
+        # auf Windows ungetestet - und die Datei ist genau fuer Windows da.
+        #
+        # Zwei Faelle, weil beide etwas Unterschiedliches beweisen. Der erste
+        # ist ein brauchbarer Pfad mit Leerzeichen: damit zeigt sich, dass der
+        # Parser nicht am ersten Leerzeichen abschneidet. Der zweite ist ein
+        # toter Pfad: damit zeigt sich, dass ein falscher Eintrag den Start
+        # nicht verhindert, sondern auf JAVA_HOME zurueckfaellt. Ein stilles
+        # Scheitern waere das Schlimmste - die Datei waere da, der Eintrag
+        # nicht, und niemand saehe es.
+        run: |
+          # Einen brauchbaren java-Ersatz unter einem Namen mit Leerzeichen
+          # legen. Eine .cmd-Datei statt einer Kopie der JVM: die braucht nicht
+          # die ganze Laufzeit und verhaelt sich fuer -version genau wie java.
+          $shim = Join-Path $env:RUNNER_TEMP "mit leerzeichen"
+          New-Item -ItemType Directory -Path $shim -Force | Out-Null
+          $javaCmd = Join-Path $shim "java.cmd"
+          @(
+            "@echo off"
+            "`"$env:JAVA_HOME\bin\java.exe`" %*"
+          ) | Set-Content -Path $javaCmd -Encoding ascii
+          Write-Host "Shim: $javaCmd"
+
+          $conf = "start.local.conf"
+
+          @(
+            "# Kommentar mit java= darf nichts bewirken"
+            ""
+            "   java   =   $javaCmd   "
+            "MAVEN=/gibt es nicht/mvn.cmd"
+          ) | Set-Content -Path $conf -Encoding ascii
+
+          $ausgabe = cmd /c "start.bat -Pruefen" 2>&1
+          $code = $LASTEXITCODE
+          $text = ($ausgabe | Out-String)
+          Write-Host "=== Fall 1: brauchbarer Pfad mit Leerzeichen ==="
+          # Die Rueckgabe mit ausgeben: eine leere Ausgabe und ein Skript,
+          # das gar nicht erst gelaufen ist, sehen sonst gleich aus.
+          Write-Host "Rueckgabe: $code, Zeilen: $((($ausgabe | Out-String) -split "`n").Count - 1)"
+          Write-Host $text
+
+          if (-not $text.Contains("Konfig  :")) {
+            throw "start.bat meldet die Konfiguration nicht"
+          }
+          if (-not $text.Contains("(start.local.conf)")) {
+            throw "der Eintrag wurde nicht uebernommen: $text"
+          }
+          if ($text -notmatch "mit leerzeichen") {
+            throw "der Pfad kam abgeschnitten an - Leerzeichen im Wert gehen nicht"
+          }
+          Write-Host "start.bat hat den Pfad mit Leerzeichen uebernommen."
+
+          @(
+            "java=/gibt es nicht/java"
+            "maven=/gibt es nicht/mvn.cmd"
+          ) | Set-Content -Path $conf -Encoding ascii
+
+          $ausgabe2 = cmd /c "start.bat -Pruefen" 2>&1
+          $code2 = $LASTEXITCODE
+          $text2 = ($ausgabe2 | Out-String)
+          Write-Host "Rueckgabe: $code2"
+          Write-Host "=== Fall 2: toter Pfad ==="
+          Write-Host $text2
+
+          if ($text2.Contains("(start.local.conf)")) {
+            throw "ein toter Pfad wurde als benutzt gemeldet: $text2"
+          }
+          if (-not ($text2 -match "Java\s+:.*\(JAVA_HOME\)")) {
+            throw "start.bat ist nicht auf JAVA_HOME zurueckgefallen: $text2"
+          }
+          Write-Host "start.bat faellt auf JAVA_HOME zurueck. Beide Faelle in Ordnung."
+
+          Remove-Item $conf -Force
+          Remove-Item $shim -Recurse -Force
+
+      - name: start.bat baut ohne fertiges Jar
+        shell: pwsh
+        # Die Luecke, durch die beide Aenderungen aus dem Commit "an Windows
+        # Umgebung angepasst" gekrochen sind: start.bat wurde auf diesem
+        # Runner nie zum Bauen gebracht, weil das Jar aus dem Testlauf vorher
+        # schon da war. "Bauen ..." kam im ganzen Protokoll nicht vor, und der
+        # Build-Pfad - genauer die Zeile, die JAVA_HOME auf einen festen Pfad
+        # gesetzt hat - lief nie. Ein fest eingetragener Pfad in genau diesem
+        # Block hat auf einem Rechner ohne dieses JDK den Build zerstoert,
+        # ohne dass ein Test es bemerkt haette.
+        run: |
+          $vorher = @(Get-ChildItem target\JsonClipboardFormatter-*.jar -ErrorAction SilentlyContinue)
+          Write-Host "JAR vorher vorhanden: $($vorher.Count)"
+          $vorher | Remove-Item -Force
+          $beginn = Get-Date
+
+          $log = Join-Path $env:RUNNER_TEMP "bauen.log"
+          $prozess = Start-Process -FilePath "cmd.exe" `
+              -ArgumentList "/c", "start.bat -Neu" `
+              -PassThru -NoNewWindow `
+              -RedirectStandardOutput $log `
+              -RedirectStandardError "$log.err"
+          Write-Host "start.bat -Neu gestartet: $($prozess.Id)"
+
+          # Nicht auf "irgendein java.exe" warten: Maven startet fuer den Build
+          # selbst eine, aus demselben JAVA_HOME wie die App danach. Nach ein
+          # paar Sekunden laeuft also die Maven-JVM, die Schleife bricht, und
+          # das Jar ist noch gar nicht gebaut - der Schritt waere an der
+          # falschen Stelle rot geworden. Gesucht wird deshalb die JVM, deren
+          # Aufrufzeile das Jar nennt; das kann nur die App sein.
+          $app = $null
+          for ($i = 0; $i -lt 150; $i++) {
+            Start-Sleep -Seconds 2
+            $app = @(Get-CimInstance Win32_Process -Filter "Name = 'java.exe'" -ErrorAction SilentlyContinue |
+                     Where-Object { $_.CommandLine -like "*JsonClipboardFormatter-*.jar*" })
+            if ($app.Count -gt 0) { break }
+            if ($prozess.HasExited) {
+              Write-Host "start.bat endete vorzeitig mit $($prozess.ExitCode)"
+              break
+            }
+          }
+
+          Write-Host "--- bauen.log ---"
+          if (Test-Path $log) { Get-Content $log }
+          Write-Host "--- bauen.log.err ---"
+          if (Test-Path "$log.err") { Get-Content "$log.err" }
+
+          $roh = Get-Content $log -Raw
+          if ($roh -notmatch "Bauen \.\.\.") {
+            throw "start.bat hat nicht gebaut - der Build-Pfad laeuft nie"
+          }
+          $jetzt = @(Get-ChildItem target\JsonClipboardFormatter-*.jar -ErrorAction SilentlyContinue)
+          if ($jetzt.Count -eq 0) {
+            throw "start.bat meldete 'Bauen ...', hat aber kein Jar erzeugt"
+          }
+          # Ein Jar, das schon vorher da war und nur die Uhrzeit behalten hat,
+          # waere von einem frischen Build nicht zu unterscheiden. Das Alter ist
+          # das einzige, was die beiden Zustaende wirklich trennt.
+          if ($jetzt[0].LastWriteTime -le $beginn) {
+            throw "das Jar ist nicht neu: $($jetzt[0].LastWriteTime) ist vor dem Lauf entstanden"
+          }
+          if ($app.Count -eq 0) {
+            throw "die App startet nicht im frisch gebauten Zustand"
+          }
+          $app | ForEach-Object { Write-Host "  JVM: $($_.ProcessId) $($_.CommandLine)" }
+          $app | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+          if (-not $prozess.HasExited) { $prozess | Stop-Process -Force }
+          Write-Host "Beendet. start.bat baut aus dem Quelltext und startet die App."
+
+      - name: Kurzfassung als Protokoll
+        if: always()
+        shell: pwsh
+        run: |
+          $jvm = java -version 2>&1
+          Write-Host "=== Java des Runners ==="
+          $jvm | ForEach-Object { Write-Host $_ }
+          $bat = Get-Item start.bat
+          Write-Host "=== start.bat ==="
+          Write-Host "Groesse: $($bat.Length) Bytes"
+          $roh = [System.IO.File]::ReadAllBytes($bat.FullName)
+          $crlf = 0
+          for ($i = 1; $i -lt $roh.Length; $i++) {
+            if ($roh[$i] -eq 10 -and $roh[$i - 1] -eq 13) { $crlf++ }
+          }
+          Write-Host "CRLF-Zeilen: $crlf"
+          if ($crlf -lt 20) { throw "start.bat hat kein CRLF (nur $crlf) - die .gitattributes greifen nicht" }
