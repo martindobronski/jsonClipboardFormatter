@@ -172,24 +172,14 @@ public final class FormatterPanel extends JPanel {
     private static Theme aktuellesTheme = STANDARD;
 
     /**
-     * Das Textfeld. Als {@link JTextPane}, weil {@link JTextArea} keine
-     * eingefaerbten Bereiche kennt - die Einfaerbung braucht zwingend ein
-     * {@link javax.swing.text.StyledDocument}.
-     *
-     * <p>Zwei Abweichungen von {@link JTextPane} sind Absicht: Der Text bricht
-     * <em>nicht</em> um, weil ein umgebrochener Schluessel nicht mehr als
-     * Schluessel erkennbar ist, und die Fenstergroesse wird ueber eine feste
-     * Zeilenzahl gesteuert, weil die Standard-PreferredSize von {@code JTextPane}
-     * den <em>gesamten</em> Text umschliesst - {@code pack()} wuerde daraus ein
-     * Fenster in der Groesse der Antwort einer API machen.
-     */
-    /**
      * Wie {@link LineBorder}, aber mit einem Radius, der wirklich zu sehen ist.
      * Die runden Ecken aus {@code BorderFactory} messen zwei Pixel und
      * fallen deshalb nicht auf. Weiterhin ein {@code LineBorder}, damit die
      * Farbe so auslesbar bleibt wie bei den uebrigen Rahmen.
      */
     private static final class RundeLinie extends LineBorder {
+        private static final long serialVersionUID = 1L;
+
         private final int radius;
 
         RundeLinie(Color farbe, int radius) {
@@ -418,7 +408,7 @@ public final class FormatterPanel extends JPanel {
             if (wurzel == null) {
                 return 0;
             }
-            int inhalt = (int) Math.round(wurzel.getPreferredSpan(View.Y_AXIS));
+              int inhalt = Math.round(wurzel.getPreferredSpan(View.Y_AXIS));
             Insets rand = getMargin();
             return inhalt + rand.top + rand.bottom;
         }
@@ -481,6 +471,18 @@ public final class FormatterPanel extends JPanel {
         }
     }
 
+    /**
+     * Das Textfeld. Als {@link JTextPane}, weil {@link JTextArea} keine
+     * eingefaerbten Bereiche kennt - die Einfaerbung braucht zwingend ein
+     * {@link javax.swing.text.StyledDocument}.
+     *
+     * <p>Zwei Abweichungen von {@link JTextPane} sind Absicht: Der Text bricht
+     * <em>nicht</em> um, weil ein umgebrochener Schluessel nicht mehr als
+     * Schluessel erkennbar ist, und die Fenstergroesse wird ueber eine feste
+     * Zeilenzahl gesteuert, weil die Standard-PreferredSize von {@code JTextPane}
+     * den <em>gesamten</em> Text umschliesst - {@code pack()} wuerde daraus ein
+     * Fenster in der Groesse der Antwort einer API machen.
+     */
     private final Editor jsonArea = new Editor(this::setzeBildschirmzeilen);
 
     /** Vom Textfeld gemeldet: so viele Zeilen stehen wirklich im Textfeld. */
@@ -606,6 +608,10 @@ public final class FormatterPanel extends JPanel {
         // Ohne diesen Listener bliebe die Freischaltung nach dem Einlesen
         // stehen, sobald der Text von Hand geaendert wurde.
         jsonArea.getDocument().addDocumentListener(new javax.swing.event.DocumentListener() {
+            /**
+             * Faellt eine Aenderung des Textfelds auf. Wird waehrend der Einfaerbung
+             * nicht aufgerufen - siehe {@link #faerbeHoch()}.
+             */
             @Override
             public void insertUpdate(javax.swing.event.DocumentEvent e) {
                 if (faerbtGerade) {
@@ -775,10 +781,6 @@ public final class FormatterPanel extends JPanel {
         return aufbau[0].getDefaultConfiguration().getBounds();
     }
 
-    /**
-     * Faellt eine Aenderung des Textfelds auf. Wird waehrend der Einfaerbung
-     * nicht aufgerufen - siehe {@link #faerbeHoch()}.
-     */
     /**
      * Zeilen und Zeichen unter dem Textfeld mitzaehlen. Bei einer
      * Formatieraufgabe die einzige Zahl, die man beim Kuerzen im Blick
@@ -1442,7 +1444,7 @@ public final class FormatterPanel extends JPanel {
             g2.draw(new java.awt.geom.Line2D.Float(5f, 10.5f, 8.5f, 10.5f));
         }
 
-        /** Zauberstab: der Text wird ohne Rueckfrage sortiert. */
+        /** Zauberstab: aus einer Zeile wird eine eingerueckte Liste. */
         private static void zauberstab(Graphics2D g2) {
             g2.draw(new java.awt.geom.Line2D.Float(2.5f, 12.5f, 9.5f, 5.5f));
             g2.draw(new java.awt.geom.Line2D.Float(1.5f, 10f, 4f, 12.5f));
@@ -1466,7 +1468,6 @@ public final class FormatterPanel extends JPanel {
             g2.draw(new Line2D.Float(11f, 12f, 9f, 10f));
         }
 
-        /** Pfeil nach unten in die Ablage: der Text verlaesst die App. */
         /** Sichel statt Vollmond: der ausgeschnittene Kreis wird als
          *  Form subtrahiert, damit der Hintergrund nicht durchscheint. */
         private static void mond(Graphics2D g2) {
@@ -1485,6 +1486,7 @@ public final class FormatterPanel extends JPanel {
             }
         }
 
+        /** Pfeil nach unten in die Ablage: der Text verlaesst die App. */
         private static void pfeil(Graphics2D g2) {
             g2.draw(new java.awt.geom.Line2D.Float(7.5f, 1.5f, 7.5f, 9.5f));
             g2.draw(new java.awt.geom.Line2D.Float(4f, 6.5f, 7.5f, 10f));

@@ -161,12 +161,12 @@ final class JsonLeser {
         }
     }
 
-    /** Ein Schlüssel ist ein String, ein Wert nicht. */
     /** Der Rahmen, in dem gelesen wird: der oberste der Liste. */
     private static Rahmen rahmen(List<Rahmen> stapel) {
         return stapel.get(stapel.size() - 1);
     }
 
+    /** Ein Schlüssel ist ein String, ein Wert nicht. */
     private static void leseImObjekt(Rahmen rahmen, JsonToken token, JsonToken.Art art) throws JsonFehler {
         switch (rahmen.zustand) {
             case OBER_OEFFNET, NACH_KOMMA -> {

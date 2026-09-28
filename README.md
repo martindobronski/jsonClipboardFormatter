@@ -245,8 +245,12 @@ src/main/resources/
   version.properties            Version und Datum, von Maven gefüllt
 ```
 
-184 Tests, davon 1 unter macOS absichtlich übersprungen (der Fokusring braucht
-ein echtes Fenster im Vordergrund):
+184 Tests, davon 1 absichtlich übersprungen: `fokusring_wird_gemalt` prüft, ob
+der Fokusring wirklich gezeichnet wird, und braucht dafür ein Fenster im
+Vordergrund. Im Hintergrundlauf — in der CI, unter Linux, beim Ausführen aus
+einem Test heraus — bekommt der Knopf den Fokus nicht, und der Test wird
+übersprungen statt geraten. Auf macOS und auf der Windows-CI ist es jeweils
+genau dieser eine Fall.
 
 | Klasse | Tests | Wofür |
 | --- | --- | --- |
@@ -276,6 +280,15 @@ Unix-Zeilenenden sich weigert zu laufen. Die Workflows in `.github/workflows/`
 halten sich aus demselben Grund an ASCII. `start.local.conf` wird nicht
 versioniert: Sie ist für die eigenen Pfade da, und das Skript weist auf die
 Vorlage `start.conf.example` hin, falls sie fehlt.
+
+Zwei Workflows laufen bei jedem Push auf `main`:
+
+- `windows-pruefung.yml` baut das Programm, führt alle 184 Tests aus und
+  startet `start.bat` auf einem echten `windows-latest`.
+- `release-windows.yml` baut zusätzlich das ZIP mit der Java-Laufzeit und
+  startet es in einem Lauf, in dem `JAVA_HOME` und `PATH` kein Java finden.
+  Damit ist belegt, dass das ZIP auf einem Rechner ohne Java startet — nicht
+  nur, dass es sich bauen lässt.
 
 ## Auf macOS per Tastenkürzel
 
